@@ -1,7 +1,6 @@
 """
-Stephenson Agency — Ricochet360 Call History Scraper
-Runs daily via GitHub Actions at 6am
-Logs into Ricochet360, downloads call history, saves as JSON for the dashboard
+Stephenson Agency — Ricochet360 Call History Scraper v2
+Logs into reports.ricochet.me directly to get the session cookie accepted
 """
 
 import requests
@@ -10,19 +9,18 @@ import csv
 import io
 import os
 import sys
+import re
+import time
 from datetime import datetime, timedelta
 
-# ── CREDENTIALS (set these as GitHub Secrets) ────────────────────────────────
 RICOCHET_EMAIL    = os.environ.get('RICOCHET_EMAIL', '')
 RICOCHET_PASSWORD = os.environ.get('RICOCHET_PASSWORD', '')
 RICOCHET_DOMAIN   = 'stephenson.ricochet.me'
 REPORTS_BASE      = 'https://reports.ricochet.me/stephenson'
 MAIN_LINES        = {'15094081190', '15095162250', '15095353171'}
 
-# ── DATE RANGE ───────────────────────────────────────────────────────────────
-# Pull last 60 days every run so the dashboard always has plenty of history
-today    = datetime.now()
-from_dt  = today - timedelta(days=60)
+today   = datetime.now()
+from_dt = today - timedelta(days=60)
 FROM_STR = from_dt.strftime('%Y-%m-%d')
 TO_STR   = today.strftime('%Y-%m-%d')
 
@@ -31,38 +29,89 @@ REPORT_FIELDS = [
     'Duration', 'caller_id', 'to', 'call_campaign', 'lead_name'
 ]
 
-def login(session):
-    """Log into Ricochet360 and return authenticated session"""
-    print(f"Logging in as {RICOCHET_EMAIL}...")
-
-    # Get CSRF token first
-    r = session.get(f'https://{RICOCHET_DOMAIN}/login')
+def get_csrf(session, url):
+    r = session.get(url)
     r.raise_for_status()
+    match = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
+    return match.group(1) if match else ''
 
-    # Extract CSRF token from HTML
-    import re
-    csrf = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
-    csrf_token = csrf.group(1) if csrf else ''
-
-    # Submit login form
+def login_main(session):
+    """Log into the main Ricochet360 site"""
+    print(f"Logging into main site as {RICOCHET_EMAIL}...")
+    csrf = get_csrf(session, f'https://{RICOCHET_DOMAIN}/login')
     r = session.post(f'https://{RICOCHET_DOMAIN}/login', data={
-        '_token': csrf_token,
+        '_token': csrf,
         'email': RICOCHET_EMAIL,
         'password': RICOCHET_PASSWORD,
-    }, headers={
-        'Referer': f'https://{RICOCHET_DOMAIN}/login',
-        'Content-Type': 'application/x-www-form-urlencoded',
-    }, allow_redirects=True)
+    }, headers={'Referer': f'https://{RICOCHET_DOMAIN}/login'}, allow_redirects=True)
+    success = 'dashboard' in r.url or r.status_code == 200 and 'login' not in r.url
+    print(f"Main login: {'OK' if success else 'FAILED'} — at {r.url}")
+    return success
 
-    if 'dashboard' in r.url or r.status_code == 200:
-        print("Login successful")
-        return True
+def login_reports(session):
+    """Log into the reports subdomain — tries multiple approaches"""
+    print("Logging into reports subdomain...")
 
-    print(f"Login failed — ended up at: {r.url}")
-    return False
+    # Approach 1: reports subdomain may have its own login page
+    try:
+        r = session.get(f'{REPORTS_BASE}/login', allow_redirects=True)
+        print(f"Reports login page status: {r.status_code} url: {r.url}")
+        
+        if 'login' in r.url or 'login' in r.text.lower():
+            csrf = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
+            csrf_token = csrf.group(1) if csrf else ''
+            
+            r2 = session.post(f'{REPORTS_BASE}/login', data={
+                '_token': csrf_token,
+                'email': RICOCHET_EMAIL,
+                'password': RICOCHET_PASSWORD,
+            }, headers={'Referer': f'{REPORTS_BASE}/login'}, allow_redirects=True)
+            print(f"Reports login post: {r2.status_code} url: {r2.url}")
+    except Exception as e:
+        print(f"Reports login approach 1 failed: {e}")
 
-def fetch_report(session):
-    """POST to reports backend to request call history"""
+    # Approach 2: hit the reports index to trigger auth via shared session
+    try:
+        r = session.get(f'{REPORTS_BASE}/', allow_redirects=True)
+        print(f"Reports index: {r.status_code} url: {r.url}")
+    except Exception as e:
+        print(f"Reports index failed: {e}")
+
+    # Approach 3: try SSO endpoint that syncs the session across subdomains
+    for sso_path in ['/auth/sso', '/sso', '/api/auth', '/api/login']:
+        try:
+            r = session.post(f'https://{RICOCHET_DOMAIN}{sso_path}', json={
+                'email': RICOCHET_EMAIL, 'password': RICOCHET_PASSWORD
+            }, headers={'Accept': 'application/json'})
+            print(f"SSO {sso_path}: {r.status_code}")
+            if r.status_code == 200:
+                data = r.json()
+                token = data.get('token') or data.get('access_token') or data.get('auth_token')
+                if token:
+                    print(f"Got SSO token: {token[:20]}...")
+                    session.headers.update({'Authorization': f'Bearer {token}'})
+                    return token
+        except Exception as e:
+            continue
+
+    # Approach 4: get API token from authenticated session
+    try:
+        r = session.get(f'https://{RICOCHET_DOMAIN}/api/v4/me', 
+                       headers={'Accept': 'application/json'})
+        print(f"API /me: {r.status_code} — {r.text[:200]}")
+        if r.ok:
+            data = r.json()
+            token = data.get('api_token') or data.get('token') or data.get('auth_token')
+            if token:
+                print(f"Got user API token: {token[:20]}...")
+                return token
+    except Exception as e:
+        print(f"/me failed: {e}")
+
+    return None
+
+def fetch_report(session, token=None):
+    """POST report request to reports subdomain"""
     print(f"Fetching call history {FROM_STR} to {TO_STR}...")
 
     payload = {
@@ -77,93 +126,131 @@ def fetch_report(session):
         }
     }
 
-    r = session.post(
-        f'{REPORTS_BASE}/api/reports/report_request',
-        json=payload,
-        headers={
-            'Accept':          'application/json',
-            'Content-Type':    'application/json',
-            'Referer':         f'{REPORTS_BASE}/',
-            'X-Requested-With': 'XMLHttpRequest',
-        }
-    )
+    headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Referer': f'{REPORTS_BASE}/',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Origin': 'https://reports.ricochet.me',
+    }
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
 
-    print(f"Report request status: {r.status_code}")
-    print(f"Response preview: {r.text[:300]}")
+    # Try with session (cookie auth)
+    r = session.post(f'{REPORTS_BASE}/api/reports/report_request',
+                     json=payload, headers=headers)
+    print(f"Report request: {r.status_code} — {r.text[:300]}")
     return r
 
-def poll_for_csv(session, response_data):
-    """If the API returns a job ID, poll until the CSV is ready"""
-    import time
-
-    job_id = (response_data.get('job_id') or
-              response_data.get('request_id') or
-              response_data.get('id'))
-
-    if not job_id:
+def handle_response(session, r):
+    """Parse response — handle sync data, async job, or CSV download"""
+    if not r.ok:
         return None
 
-    print(f"Got job ID: {job_id} — polling for result...")
+    # Check content type — might be CSV directly
+    ct = r.headers.get('Content-Type', '')
+    if 'text/csv' in ct or 'application/csv' in ct:
+        print("Got CSV directly")
+        return parse_csv(r.text)
 
-    for attempt in range(20):
-        time.sleep(3)
-        r = session.get(
-            f'{REPORTS_BASE}/api/reports/report_request/{job_id}',
-            headers={'Accept': 'application/json'}
-        )
+    try:
         data = r.json()
-        status = data.get('status', '')
-        print(f"  Poll {attempt+1}: status={status}")
+    except Exception:
+        # Try as CSV
+        try:
+            return parse_csv(r.text)
+        except Exception as e:
+            print(f"Could not parse response: {e}")
+            print(f"Raw: {r.text[:300]}")
+            return None
 
-        if status in ('complete', 'done', 'finished') or data.get('download_url') or data.get('file_url'):
-            return data
-        if data.get('rows') or data.get('data') or data.get('results'):
-            return data
+    print(f"Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
 
+    # Async job
+    job_id = (data.get('job_id') or data.get('request_id') or
+              data.get('id') if isinstance(data, dict) else None)
+    if job_id and not data.get('data') and not data.get('rows'):
+        print(f"Async job: {job_id} — polling...")
+        return poll_job(session, job_id)
+
+    # Direct data
+    if isinstance(data, list):
+        return data
+    for key in ('data', 'rows', 'results', 'calls', 'call_history', 'records'):
+        if key in data and isinstance(data[key], list):
+            return data[key]
+
+    # Download URL
+    dl = data.get('download_url') or data.get('file_url') or data.get('url')
+    if dl:
+        print(f"Download URL: {dl}")
+        r2 = session.get(dl)
+        return parse_csv(r2.text) if r2.ok else None
+
+    print(f"Unknown response structure: {json.dumps(data)[:400]}")
+    return None
+
+def poll_job(session, job_id, max_attempts=15):
+    for i in range(max_attempts):
+        time.sleep(3)
+        try:
+            r = session.get(f'{REPORTS_BASE}/api/reports/report_request/{job_id}',
+                           headers={'Accept': 'application/json'})
+            data = r.json()
+            status = data.get('status', '')
+            print(f"  Poll {i+1}: status={status} keys={list(data.keys())}")
+
+            dl = data.get('download_url') or data.get('file_url') or data.get('url')
+            if dl:
+                r2 = session.get(dl)
+                return parse_csv(r2.text) if r2.ok else None
+
+            for key in ('rows', 'data', 'results', 'calls'):
+                if key in data and isinstance(data[key], list):
+                    return data[key]
+
+            if status in ('complete', 'done', 'finished', 'completed'):
+                return data.get('rows') or data.get('data') or []
+        except Exception as e:
+            print(f"  Poll {i+1} error: {e}")
     print("Polling timed out")
     return None
 
-def download_csv(session, url):
-    """Download CSV from a URL"""
-    r = session.get(url)
-    r.raise_for_status()
-    return r.text
+def parse_csv(text):
+    try:
+        reader = csv.DictReader(io.StringIO(text))
+        rows = list(reader)
+        print(f"Parsed {len(rows)} CSV rows")
+        return rows
+    except Exception as e:
+        print(f"CSV parse error: {e}")
+        return None
 
-def parse_csv_to_json(csv_text):
-    """Parse CSV into list of dicts"""
-    reader = csv.DictReader(io.StringIO(csv_text))
-    return list(reader)
-
-def normalize_rows(rows):
-    """Normalize field names to what the dashboard expects"""
-    normalized = []
+def normalize(rows):
+    out = []
     for r in rows:
-        normalized.append({
-            'Lead ID':           r.get('lead_id') or r.get('Lead ID') or '',
-            'Call Date':         r.get('created_at') or r.get('Call Date') or '',
-            'Call Type':         r.get('call_type') or r.get('Call Type') or '',
-            'Agent':             r.get('user_name') or r.get('Agent') or '',
-            'Call Duration':     r.get('Duration') or r.get('Call Duration') or '0',
-            'From Number':       r.get('caller_id') or r.get('From Number') or '',
-            'To Number':         r.get('to') or r.get('To Number') or '',
-            'Call Campaign':     r.get('call_campaign') or r.get('Call Campaign') or '',
-            'Full Name':         r.get('lead_name') or r.get('Full Name') or '',
+        out.append({
+            'Lead ID':       r.get('lead_id')      or r.get('Lead ID')       or '',
+            'Call Date':     r.get('created_at')   or r.get('Call Date')     or '',
+            'Call Type':     r.get('call_type')    or r.get('Call Type')     or '',
+            'Agent':         r.get('user_name')    or r.get('Agent')         or '',
+            'Call Duration': r.get('Duration')     or r.get('Call Duration') or '0',
+            'From Number':   r.get('caller_id')    or r.get('From Number')   or '',
+            'To Number':     r.get('to')           or r.get('To Number')     or '',
+            'Call Campaign': r.get('call_campaign')or r.get('Call Campaign') or '',
+            'Full Name':     r.get('lead_name')    or r.get('Full Name')     or '',
         })
-    return normalized
+    return out
 
 def filter_main_lines(rows):
-    """Keep only calls to the 3 main lines"""
-    def clean(n):
-        return ''.join(c for c in str(n) if c.isdigit())
-
-    filtered = [r for r in rows if clean(r.get('To Number', '')) in MAIN_LINES]
-    print(f"Total rows: {len(rows)} → Main line rows: {len(filtered)}")
+    clean = lambda n: ''.join(c for c in str(n) if c.isdigit())
+    filtered = [r for r in rows if clean(r.get('To Number','')) in MAIN_LINES]
+    print(f"Total: {len(rows)} → Main line: {len(filtered)}")
     return filtered
 
-def save_output(rows):
-    """Save to data/call_history.json"""
+def save(rows):
     os.makedirs('data', exist_ok=True)
-    output = {
+    out = {
         'updated_at': datetime.now().isoformat(),
         'from_date':  FROM_STR,
         'to_date':    TO_STR,
@@ -171,75 +258,44 @@ def save_output(rows):
         'calls':      rows,
     }
     with open('data/call_history.json', 'w') as f:
-        json.dump(output, f, indent=2)
+        json.dump(out, f, indent=2)
     print(f"Saved {len(rows)} calls to data/call_history.json")
 
 def main():
     if not RICOCHET_EMAIL or not RICOCHET_PASSWORD:
-        print("ERROR: RICOCHET_EMAIL and RICOCHET_PASSWORD must be set as environment variables")
+        print("ERROR: Set RICOCHET_EMAIL and RICOCHET_PASSWORD as GitHub Secrets")
         sys.exit(1)
 
     session = requests.Session()
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36'
     })
 
-    # Step 1: Login
-    if not login(session):
-        print("ERROR: Login failed")
+    # Step 1: Login to main site
+    if not login_main(session):
+        print("ERROR: Main site login failed")
         sys.exit(1)
 
-    # Step 2: Request report
-    r = fetch_report(session)
+    # Step 2: Authenticate with reports subdomain
+    token = login_reports(session)
 
-    rows = []
+    # Step 3: Fetch report
+    r = fetch_report(session, token)
 
-    if r.status_code == 200:
-        try:
-            data = r.json()
-
-            # Check if it's an async job
-            if data.get('job_id') or data.get('request_id') or data.get('id'):
-                result = poll_for_csv(session, data)
-                if result:
-                    dl_url = result.get('download_url') or result.get('file_url') or result.get('url')
-                    if dl_url:
-                        csv_text = download_csv(session, dl_url)
-                        rows = parse_csv_to_json(csv_text)
-                    else:
-                        rows = result.get('rows') or result.get('data') or result.get('results') or []
-            else:
-                # Synchronous response
-                rows = (data if isinstance(data, list) else
-                        data.get('data') or data.get('rows') or
-                        data.get('results') or data.get('calls') or [])
-
-        except Exception as e:
-            # Maybe it returned CSV directly
-            print(f"JSON parse failed ({e}), trying CSV...")
-            try:
-                rows = parse_csv_to_json(r.text)
-            except Exception as e2:
-                print(f"CSV parse also failed: {e2}")
-                print(f"Raw response: {r.text[:500]}")
-                sys.exit(1)
-
-    elif r.status_code == 302 or 'login' in r.url:
-        print("ERROR: Got redirected to login — session may have expired")
-        sys.exit(1)
-    else:
-        print(f"ERROR: Unexpected status {r.status_code}: {r.text[:300]}")
+    if not r.ok:
+        print(f"ERROR: Report request failed with {r.status_code}: {r.text[:300]}")
         sys.exit(1)
 
-    if not rows:
-        print("WARNING: No rows returned — saving empty dataset")
+    # Step 4: Parse response
+    rows = handle_response(session, r)
+    if rows is None:
+        print("ERROR: Could not extract rows from response")
+        sys.exit(1)
 
-    # Step 3: Normalize and filter
-    rows = normalize_rows(rows)
+    # Step 5: Normalize, filter, save
+    rows = normalize(rows)
     rows = filter_main_lines(rows)
-
-    # Step 4: Save
-    save_output(rows)
+    save(rows)
     print("Done!")
 
 if __name__ == '__main__':
