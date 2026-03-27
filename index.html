@@ -1,0 +1,40 @@
+name: Daily Call History Scrape
+
+on:
+  schedule:
+    # 6am Mountain Time = 1pm UTC (adjust if you're in a different timezone)
+    # Mountain Standard Time (MST) = UTC-7, so 6am MST = 13:00 UTC
+    # Mountain Daylight Time (MDT) = UTC-6, so 6am MDT = 12:00 UTC
+    - cron: '0 13 * * 1-5'  # Mon-Fri at 6am MST / weekdays only
+
+  workflow_dispatch:  # Also allows manual trigger from GitHub UI anytime
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run scraper
+        env:
+          RICOCHET_EMAIL:    ${{ secrets.RICOCHET_EMAIL }}
+          RICOCHET_PASSWORD: ${{ secrets.RICOCHET_PASSWORD }}
+        run: python scraper.py
+
+      - name: Commit and push updated data
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/call_history.json
+          git diff --staged --quiet || git commit -m "Daily call history update $(date +'%Y-%m-%d')"
+          git push
